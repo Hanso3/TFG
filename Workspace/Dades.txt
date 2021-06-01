@@ -1,0 +1,2 @@
+Les dades crues utilitzades es poden descarregar a:
+https://www.ebi.ac.uk/ena/browser/view/PRJEB13092
