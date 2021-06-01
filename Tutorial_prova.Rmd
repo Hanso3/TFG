@@ -1,0 +1,492 @@
+---
+title: "Codi per al processament i l'anàlisi del microbioma"
+author: "Guillem Vila Tubau"
+date: "16/4/2021"
+output:
+  html_document:
+    highlight: default
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 2
+    toc_float: true
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+---
+
+![](FCT.png){width=350px}
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(out.width="70%", warning = FALSE, message = FALSE)
+```
+
+# Instal·lació de llibreries
+
+El primer pas per convertir els fitxers fastq provinents de la seqüenciació en taules d'ASVs és assegurar-nos que tenim instal·lades les llibreries necessaries
+
+```{r paquets, eval=FALSE, include=TRUE}
+#Paquets de cran
+install.packages("ggplot2")
+install.packages("gridExtra")
+install.packages("vegan")
+install.packages("devtools")
+install_url(url="https://github.com/UVic-omics/selbal/archive/master.zip", INSTALL_opt= "--no-multiarch")
+devtools::install_github("egr95/R-codacore", ref="main")
+#Paquets de bioconductor
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("dada2")
+BiocManager::install("phyloseq")
+BiocManager::install("DECIPHER")
+BiocManager::install("phangorn")
+BiocManager::install("ALDEx2")
+#Cridem llibreries
+library(ggplot2)
+library(gridExtra)
+library(dada2)
+library(phyloseq)
+library(DECIPHER)
+library(phangorn)
+library(vegan)
+library(devtools)
+library(selbal)
+library(ALDEx2)
+library(codacore)
+```
+
+# Preparació de les dades
+
+A continuació hem d'indicar en quin directori es troba la carpeta on hi ha els fitxers FASTQ comprimits (.gz) de la seqüenciació. En aquest cas l'he col·locat dins el directori de treball però és possible indicar el camí a qualsevol directori. Això facilita determinar el camí a cada fitxer FASTQ.
+
+```{r dades, eval=FALSE, include=TRUE}
+#Directori de la carpeta PRJEB13092 amb els fastqs
+files <- "./PRJEB13092"
+#Ordenem per si no estan en ordre (forwards abans que reverse), en aquest cas identifiquem si es tracta del forward o del reverse amb pattern _1 o _2 (pattern detecta patrons en el nom dels fitxers), en cas de només haver-hi un fastq per mostra no caldria fer aquest pas
+forwards <- sort(list.files(files, pattern="_1"))
+reverses <- sort(list.files(files, pattern="_2"))
+#Extraiem nom de les mostres separant per _ i eliminant el que queda a la dreta
+samples <- sapply(strsplit(forwards, "_"), `[`, 1)
+#I finalment indiquem el camí des del directori de treball a cada fastq
+forwards <- file.path(files, forwards)
+reverses <- file.path(files, reverses)
+```
+
+## Filtrat
+
+Una vegada tenim els camins a les dades apunt i hem extret els noms de les mostres podem procedir a filtrar les lectures de baixa qualitat. Fer fer-ho primer hauriem d'avaluar la qualitat de les lectures de les nostres dades en funció de la posició per determinar en quin punt tallar.
+
+```{r filt, eval=FALSE, include=TRUE}
+#Distribució de la qualitat en funció de la posició pels primers quatre forwards i reverses, estaria bé mirar-ne uns quants a l'atzar per veure si la distribució és més o menys homogènia
+plotQualityProfile(forwards[1:4])
+plotQualityProfile(reverses[1:4])
+#Indiquem on volem crear la carpeta amb els FASTQ filtrats
+filtered <- file.path(files, "filtered")
+#Comprovem si ja existeix i en cas negatiu la creem
+if(!file_test("-d", filtered)) dir.create(filtered)
+#Assignem nom als FASTQ filtrats, en aquest cas només afegeixo _filt al final del nom
+filtforward <- file.path(filtered, paste0(samples, "_1_filt.fastq.gz"))
+filtreverse <- file.path(filtered, paste0(samples, "_2_filt.fastq.gz"))
+#Filtrem, en aquest cas tallem a partir de 240 en els forwards i 160 en els reversos (encara que la seva qualitat sigui bastant dolenta)
+filtntrim <- filterAndTrim(forwards, filtforward, reverses, filtreverse, truncLen=c(240,160), maxEE=c(2,2))
+#Finalment observem el resultat
+head(filtntrim)
+```
+
+En aquest cas he fet servir tots els valors predeterminats però és altament recomanable donar un cop d'ull a totes les opcions que la funció filterAndTrim ofereix mitjançant ?filterAndTrim, per poder ajustar millor la filtració a les particularitats dels fitxers procedents de la seqüenciació.
+
+## Desreplicació
+
+A continuació desrepliquem els fitxers filtrats, ajuntant totes les seqüencies idèntiques, estimem les taxes d'error, i estimem les variants de seqüencia d'amplicó (ASV). 
+
+```{r derep, eval=FALSE, include=TRUE}
+#Desrepliquem els fitxers filtrats
+derepForward <- derepFastq(filtForward, verbose=TRUE)
+derepReverse <- derepFastq(filtReverse, verbose=TRUE)
+#Canviem el nom per el de les mostres
+names(derepForward) <- samples
+names(derepReverse) <- samples
+#Estimem taxes d'error de la desreplicació
+errorsForward <- learnErrors(derepForward)
+errorsReverse <- learnErrors(derepReverse)
+#Representació gràfica dels errors
+plotErrors(errorsForward)
+plotErrors(errorsReverse)
+#Estimem les variants de seqüencia d'amplicó
+dadaForward <- dada(derepForward, errorsForward)
+dadaReverse <- dada(derepReverse, errorsReverse)
+```
+
+# Construcció de la taula de seqüències i assignació de taxonomia
+
+Ara toca ajuntar les lectures forward i reverse, construir una taula amb el nombre de lectures per cada ASV, i eliminar quimeres (resultat de la unió de dues o més seqüències durant el procés d’amplificació per PCR) i després assignar una taxonomia a cada ASV a través d'un alineament amb un fitxer FASTA de referència.
+
+```{r clust, eval=FALSE, include=TRUE}
+#Unim forwards i reversos
+mergedPairs <- mergePairs(dadaForward, derepForward, dadaReverse, derepReverse)
+#Taula de seqüencies amb els parells units
+sequenceTable <- makeSequenceTable(mergedPairs)
+table(nchar(getSequences(sequenceTable)))
+#Eliminem quimeres
+sequenceTableChimera <- removeBimeraDenovo(sequenceTable)
+#Indiquem quin és el fitxer de referència
+refFasta <- "./rdp_train_set_18.fa.gz"
+#Assignació taxonomia
+taxonomyTable <- assignTaxonomy(sequenceTableChimera, refFasta = refFasta)
+```
+
+Amb això ja tenim la nostra taula d'ASVs sense quimeres (sequenceTableChimera) i de taxonomia (taxonomyTable).
+
+# Construcció de l'arbre filogenètic
+
+El següent pas és la construcció de l'arbre filogenètic.
+
+```{r tab, eval=FALSE, include=TRUE}
+#Agafem les seqüencies
+sequences <- getSequences(sequenceTableChimera)
+names(sequences) <- sequences
+#Alineem les seqüencies
+align <- AlignSeqs(DNAStringSet(sequences))
+#Passem a matriu per poder fer servir phyDat
+alignMatrix <- as(align, "matrix")
+#Passem a format phyDat per poder calcular distàncies, indiquem que es tracten de seqüències d'ADN
+phyDat <- phyDat(alignMatrix, type="DNA")
+#Calculem distàncies entre seqüències
+dist <- dist.ml(phyDat)
+#Creem arbre amb Neighbor-Joining
+tree <- NJ(dist)
+#Optimitzem
+fit = pml(tree, data=phyDat)
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE, rearrangement = "stochastic", control = pml.control(trace = 0))
+detach("package:phangorn", unload=TRUE)
+```
+
+# Construcció de l'objecte phyloseq
+
+Finalment ajuntarem tots els components que hem anat construïnt en un objecte phyloseq amb les metadades per facilitar l'exportació i importació de les dades processades i també la seva manipulació.
+
+```{r phy, eval=FALSE, include=TRUE}
+#Llibreria per llegir l'excel
+install.packages("readxl")
+library(readxl)
+#Llegim excel que conté les metadades
+metaData <- read_excel("PRJEB13092 meta.xlsx")
+#Passem a dataframe per facilitar el treballar-hi
+metaData <- as.data.frame(metaData)
+#Assignem com a nom de les files el RunID, que és el nom amb el qual hem estat treballant fins ara ja que era el nom que havíen donat als fitxers a la base de dades
+rownames(metaData) <- metaData$RunID
+#Seleccionem les columnes que volem conservar, en aquest cas totes
+keep.cols <- c(colnames(metaData))
+#Ens quedem només amb les mostres contingudes a la taula de seqüències
+metaData <- metaData[rownames(sequenceTable), keep.cols]
+#Creem objecte phyloseq mab la taula d'OTUs, les metadades, la taula de taxonomia i l'arbre filogenètic
+phyloseq <- phyloseq(otu_table(sequenceTableChimera, taxa_are_rows=FALSE), sample_data(metaData), tax_table(taxonomyTable), phy_tree(fitGTR$tree))
+#Assignem nom a les ASVs per fer-les més fàcilment identificables
+taxanames<-taxa_names(phyloseq)
+taxa_names(phyloseq)<-paste("ASV", 1:length(taxanames), sep = "")
+#Exportem objecte phyloseq al directori de treball
+saveRDS(phyloseq, file = "phyloseq.rds")
+```
+
+Això conclou la primera part del tutorial. Ara ja tenim el nostre objecte phyloseq i podem passar a la part de l'anàlisi.
+
+# Carregar objecte phyloseq i preprocessament
+
+En primer lloc podem carregar l'objecte phyloseq que acabem de crear mitjançant readRDS. Pot ser útil si la primera part del tutorial s'ha fet en un altre ordinador per falta de RAM o qualsevol altre problema. Una vegada tenim el nostre objecte phyloseq eliminem les ASVs que no sumen més d'un cert nombre de lectures i fem el mateix amb les mostres.
+
+```{r load, eval=FALSE, include=TRUE}
+#Llegim el fitxer rds que conté l'objecte phyloseq
+phyloseq <- readRDS("phyloseq.rds")
+
+#Eliminació d'ASVs amb menys de 10 lectures totals
+phyloseq <- prune_taxa(taxa_sums(phyloseq) > 10, phyloseq)
+#Eliminació de mostres amb menys de 10 lectures totals
+phyloseq <- prune_samples(sample_sums(phyloseq) > 10, phyloseq)
+```
+
+# Representacions diverses
+
+Hi ha diverses representacions que ens poden ajudar a entendre les nostres dades. És interessant representar les abundàncies relatives i absolutes de diferents nivells taxonòmics, a poder ser separats per les condicions.
+
+```{r repre, eval=FALSE, include=TRUE}
+#Transformació a abundàncies relatives
+relAbu <- transform_sample_counts(phyloseq, function(x) x/sum(x))
+#Aglomeració taxonòmica a nivell phylum, s'hauria de comprovar com està escrit el nom de la taxonomia que es vol aglomerar
+phylum <- tax_glom(phyloseq, "Phylum")
+#Comprovem si s'ha produït correctament
+head(tax_table(phyloseq))
+head(tax_table(phylum))
+#Ja només tenim els phylums, però els noms segueixen sent els assignats a les OTUs
+taxa_names(phylum)
+#Podem canviar el nom de les OTUs pel dels phylums
+taxa_names(phylum) <- tax_table(phylum)[, "Phylum"]
+#Aglomeració taxonòmica a nivell phylum de les abundàncies relatives
+relAbuPhylum <- tax_glom(relAbu, "Phylum")
+#I tornem a canviar el nom
+taxa_names(relAbuPhylum) <- tax_table(relAbuPhylum)[, "Phylum"]
+#I finalment podem representar les abundàncies relatives i absolutes a nivell Phylum
+plot_bar(phylum, fill = "Phylum", facet_grid = "Subject")
+plot_bar(relAbuPhylum, fill = "Phylum", facet_grid = "Subject")
+#El procés anterior es pot repetir amb qualsevol nivell taxonòmic d'interès
+```
+
+## Aglomeració dels taxons menys freqüents
+
+Una de les opcions per facilitar la representació dels fílums és l'agrupació dels taxons rars en una sola columna.
+
+```{r glom, eval=FALSE, include=TRUE}
+#Mirem quants phylums tenen una abundància relativa total per sota de 0,1
+sum(taxa_sums(relAbuPhylum) < 0.4)
+#Vector amb els phylums menys abundants
+minorPhylum <- which(taxa_sums(relAbuPhylum) < 0.4)
+#I els agrupem per facilitar l'anàlisi
+relAbuPhylumMin <- merge_taxa(relAbuPhylum, minorPhylum, 1)
+#I els hi assignem un nom nou, el numero és la columna que ens hem quedat en el procés d'agrupar i sol ser la última
+taxa_names(relAbuPhylumMin)[6]<-"Rare"
+```
+
+## Diagrama de caixes , arbre filogenètic i heatmap
+
+Altres opcions per representar les dades són fer un diagrama de caixes, que ajuda a veure quins són els taxons més i menys freqüents, i permet fer comparació entre les diferents condicions, i la representació d'un arbre filogenètic per veure la relació entre diferents unitats taxonòmiques i la seva abundància, també permetent la comparació entre les diferents condicions. També ensenyo com fer un heatmap que permet veure l'abundància de cada phylum per cada mostra.
+
+```{r box, eval=FALSE, include=TRUE}
+##Diagrama de caixes
+#Agafem la taula d'OTUs de les abundàncies relatives a nivell phylum amb els menys freqüents agrupats
+otu <- otu_table(relAbuPhylumMin)
+#Representem el diagrama de caixes de la composició a nivell phylum per controls i pacients
+subject <- sample_data(phyloseq)$Subject
+#Seleccionem controls
+otuControl <- subset(otu, subject=="Control")
+#Seleccionem pacients
+otuPatient <- subset(otu, subject=="Patient")
+#Dos diagrames un al costat de l'altre
+par(mfrow=c(1,2))
+#Representem controls
+boxplot(otuControl)
+title("Controls")
+#Representem pacients
+boxplot(otuPatient)
+title("Patients")
+
+##Arbre filogenètic
+#Agrlomerar dades a nivell classe o qualsevol altre nivell taxonòmic d'interès
+class<-tax_glom(phyloseq, "Class")
+#Agafem el phylum que ens interessa representar
+d<-subset_taxa(class, Phylum == "Firmicutes")
+#Arbre filogenètic de les classes del phylum
+plot_tree(d, ladderize="left", size="abundance", color="Subject", label.tips="Class")
+
+##Heatmap
+#Heatmap de l'abundància de cada phylum per cada mostra, invertim la intensitat del color
+plot_heatmap(phylum, sample.label="Subject", low="#66CCFF", high="#000033", na.value="white")
+```
+
+En aquest cas observem certes diferències entre el diagrama de caixes dels controls i el dels pacients a simple vista.
+
+# Diversitat alfa
+
+El següent pas és l'estimació de la diversitat alfa o diversitat dins la mostra. Al fonament teòric de la memoria he descrit alguns dels principals mètodes per calcular-la.
+
+```{r alfa, eval=FALSE, include=TRUE}
+#Rarefaccionem les dades, necessari per comprovar l'efecte de la rarefacció sobre els resultats
+raredata <- rarefy_even_depth(phyloseq, sample.size = min(sample_sums(phyloseq)), rngseed = 123)
+subject <- sample_data(phyloseq)$Subject
+#Diverses mesures de la diversitat alfa
+alpha <- estimate_richness(phyloseq, measures =c("Observed", "Chao1", "Shannon", "Simpson"))
+head(alpha)
+PD <- pd(otu_table(phyloseq), phy_tree(phyloseq), include.root=FALSE)
+#Representació gràfica de la diversitat alfa
+plot_richness(phyloseq, x="Subject", measures=c("Observed","Chao1","Shannon", "Simpson"))
+#Comparació de la diversitat alfa entre controls i pacients amb diagrama de caixes
+par(mfrow=c(2,3))
+boxplot(alpha$Observed~subject)
+title("Observed by Subject")
+boxplot(alpha$Chao1~subject)
+title("Chao1 by Subject")
+boxplot(alpha$Shannon~subject)
+title("Shannon by Subject")
+boxplot(alpha$Simpson~subject)
+title("Simpson by Subject")
+boxplot(PD$PD~subject)
+title("Phylogenetic Diversity")
+#En general els controls semblen tenir una diversitat més alta, anem a comprovar si les diferències són significatives amb una prova de Wilcoxon
+wilcox.test(alpha$Observed~subject)
+wilcox.test(alpha$Chao1~subject)
+wilcox.test(alpha$Shannon~subject)
+wilcox.test(alpha$Simpson~subject)
+wilcox.test(PD$PD~subject)
+#I una prova dels signes de Wilcoxon amb ajustament del valor p per FDR, no utilitzada en el treball
+pairwise.wilcox.test(alpha$Observed, subject, p.adjust.method ="fdr")
+pairwise.wilcox.test(alpha$Chao1, subject, p.adjust.method ="fdr")
+pairwise.wilcox.test(alpha$Shannon, subject, p.adjust.method ="fdr")
+pairwise.wilcox.test(alpha$Simpson, subject, p.adjust.method ="fdr")
+pairwise.wilcox.test(PD$PD, subject, p.adjust.method ="fdr")
+```
+
+Veiem que els resultats varien segons el càlcul, per això sempre resulta molt útil comparar el resultat entre diversos mètodes. Per avaluar l'efecte dels diferents paràmetres de filtrat inicial sobre els resultats vaig canviar el valor de les línies de codi 201 i 203 per 10, 50 i 1000, i per observar el resultat sense filtrat vaig utilitzar l'objecte filoseq sense executar les línies de codi 201 i 203, encara que substituir el seu valor per 0 i executar-les tindria el mateix efecte. Per avaluar els efectes de la rarefacció simplement vaig utilitzar raredata en comptes de phyloseq.
+
+# Diversitat beta
+
+I seguidament estimarem la diversitat beta o diversitat entre mostres, que no deixa de ser un càlcul de distància entre mostres.
+
+```{r beta, eval=FALSE, include=TRUE}
+##Diversitat beta
+#Distància Bray-Curtis
+bray <- phyloseq::distance(phyloseq, method = "bray")
+#Distància Unifrac
+#Es recomana calcular la distància unifrac utilitzant dades rarefaccionades, ho faig de les dues maneres per comparar
+unifrac <- phyloseq::distance(phyloseq, method = "unifrac")
+unifracRare <- phyloseq::distance(raredata, method = "unifrac")
+#Distància Unifrac ponderada
+wunifrac <- phyloseq::distance(phyloseq, method = "wunifrac")
+wunifracRare <- phyloseq::distance(raredata, method = "wunifrac")
+#Distància de Jaccard
+jaccard <- phyloseq::distance(phyloseq, method = "jaccard", binary = TRUE)
+```
+
+Podem comprovar si hi ha diferències significatives entre les distàncies dels controls i dels pacients amb un PERMANOVA fent servir la funció adonis del paquet vegan.
+
+```{r betadiff, eval=FALSE, include=TRUE}
+#Estudiem si hi ha diferències significatives entre les distàncies dels controls i dels pacients amb un PERMANOVA
+adonis(bray~subject)
+adonis(unifrac~subject)
+adonis(unifracRare~subject)
+adonis(wunifrac~subject)
+adonis(wunifracRare~subject)
+adonis(jaccard~subject)
+```
+
+Veiem que les diferències més significatives es troben en les distàncies de jaccard mentre que les menys significatives es troben en la unifrac ponderada. Per comprovar l'efecte dels diferents paràmetres de filtrat vaig fer el mateix que en el cas anterior.
+
+## Representació de la diversitat beta
+
+Una vegada hem calculat les distàncies podem representar-les per facilitar-ne la interpretació. Per fer-ho primer hem de fer una ordinació MDS (multidimensional scaling) o NMDS (la versió no mètrica de l'anterior), i representar-la gràficament.
+
+```{r rebeta, eval=FALSE, include=TRUE}
+##MDS
+#Ordinació MDS distància Bray-Curtis
+bray.MDS = ordinate(phyloseq, "MDS", distance = bray)
+#Representació
+plot_ordination(phyloseq, bray.MDS, color = "Subject")
+#Ordinació MDS distància Unifrac
+unifrac.MDS = ordinate(phyloseq, "MDS", distance = unifrac)
+unifrac.MDS.Rare = ordinate(raredata, "MDS", distance = unifrac)
+#Representació
+plot_ordination(phyloseq, unifrac.MDS, color = "Subject")
+plot_ordination(raredata, unifrac.MDS.Rare, color = "Subject")
+#Ordinació MDS distància Unifrac ponderada
+wunifrac.MDS = ordinate(phyloseq, "MDS", distance = wunifrac)
+wunifrac.MDS.Rare = ordinate(raredata, "MDS", distance = wunifrac)
+#Representació
+plot_ordination(phyloseq, wunifrac.MDS, color = "Subject")
+plot_ordination(raredata, wunifrac.MDS.Rare, color = "Subject")
+#Ordinació MDS distància Jaccard
+jaccard.NMDS = ordinate(phyloseq, "MDS", distance = jaccard)
+#Representació
+plot_ordination(phyloseq, jaccard.NMDS, color = "Subject")
+
+##NMDS, no mostrat a la memòria
+#Ordinació NMDS distància Bray-Curtis
+bray.NMDS = ordinate(phyloseq, "NMDS", distance = bray)
+#Representació
+plot_ordination(phyloseq, bray.NMDS, color = "Subject")
+#Ordinació NMDS distància Unifrac
+unifrac.NMDS = ordinate(phyloseq, "NMDS", distance  = unifrac)
+unifrac.NMDS.Rare = ordinate(raredata, "NMDS", distance  = unifrac)
+#Representació
+plot_ordination(phyloseq, unifrac.NMDS, color = "Subject")
+plot_ordination(raredata, unifrac.NMDS.Rare, color = "Subject")
+#Ordinació NMDS distància Unifrac ponderada
+wunifrac.NMDS = ordinate(phyloseq, "NMDS", distance  = wunifrac)
+wunifrac.NMDS.Rare = ordinate(raredata, "NMDS", distance  = wunifrac)
+#Representació
+plot_ordination(phyloseq, wunifrac.NMDS, color = "Subject")
+plot_ordination(raredata, wunifrac.NMDS.Rare, color = "Subject")
+#Ordinació NMDS distància Jaccard
+jaccard.NMDS = ordinate(phyloseq, "NMDS", distance  = jaccard)
+#Representació
+plot_ordination(phyloseq, jaccard.NMDS, color = "Subject")
+```
+
+# Prova d'abundàncies diferencials
+
+Per la prova d'abundàncies diferencials farem servir aldex del paquet ALDEx2, que és una de les funcions més senzilles d'utilitzar per aquest propòsit.
+
+```{r abudiff, eval=FALSE, include=TRUE}
+#Aldex2, transposo la taula d'OTUs per tenir les mostres a les columnes com demana la funció
+aldexTest <- aldex(t(otu_table(phyloseq)), subject, test="t", effect = TRUE, verbose = TRUE, denom = "zero")
+View(aldexTest)
+par(mfrow=c(1,1))
+aldex.plot(aldexTest, type="MW", test="wilcox")
+#Comprovem quina taxonomia es va assignar a les ASVs diferencialment abundants
+tax_table(phyloseq)["ASV80"]
+tax_table(phyloseq)["ASV65"]
+tax_table(phyloseq)["ASV74"]
+tax_table(phyloseq)["ASV113"]
+tax_table(phyloseq)["ASV29"]
+tax_table(phyloseq)["ASV73"]
+tax_table(phyloseq)["ASV62"]
+tax_table(phyloseq)["ASV23"]
+tax_table(phyloseq)["ASV27"]
+tax_table(phyloseq)["ASV22"]
+tax_table(phyloseq)["ASV37"]
+tax_table(phyloseq)["ASV67"]
+tax_table(phyloseq)["ASV72"]
+tax_table(phyloseq)["ASV100"]
+
+#Mateixa prova a nivell fílum
+phylum <- tax_glom(phyloseq, "Phylum")
+taxa_names(phylum) <- tax_table(phylum)[, "Phylum"]
+aldexPhylum <- aldex(t(otu_table(phylum)), subject, test="t", effect = TRUE, verbose = TRUE, denom = "zero")
+View(aldexPhylum)
+par(mfrow=c(1,1))
+aldex.plot(aldexPhylum, type="MW", test="wilcox")
+```
+
+L'avaluació de diferents paràmetres de filtrat i els efectes de la rarefacció es van avaluar com en els dos casos anteriors. Per la respresentació dels fílums diferencialment abundants es va fer servir la funció plot_tree, la seva execució es troba a les línies 272 a 278.
+
+# Selecció de balanços
+
+Finalment podem intentar seleccionar balanços entre ASVs que es puguin associar a la condició mitjançant selbal i CoDaCoRe. Proves fetes al nivell taxonòmic família.
+
+```{r selbal, eval=FALSE, include=TRUE}
+##Selbal
+dev.off() #Netejar finestra
+family <- tax_glom(phyloseq, "Family")
+taxa_names(family) <- tax_table(family)[,"Family"]
+x <- otu_table(family)
+x <- x + 1
+balance <- selbal(x, as.factor(subject))
+balance
+#Diagrama del balanç
+dev.off() #Netejar finestra
+grid.draw(balance$global.plot2)
+#Precisió de predicció del balanç seleccionat
+dev.off() #Netejar finestra
+balance$ROC.plot
+
+##CoDaCoRe
+model = codacore(
+  x, #Taula 
+  subject, #Variable resposta
+  logRatioType = "balances", #Selecció de balanços
+  lambda = 1 #Força de la regularització
+)
+print(model)
+plot(model)
+```
+
+L'avaluació de diferents paràmetres de filtrat es va fer com en els tres casos anteriors. Per aquests mètodes no vaig avaluar els efectes de la rarefacció.
+
+# Referències
+
+Calle, M. Statistical Methods for Microbiome Analysis. Retrieved 12/11/2020.
+
+Callahan, B., Sankaran, K., Fukuyama, J., McMurdie, P., & Holmes, S. (2017). Workflow for Microbiome Data Analysis: from raw reads to community analyses. Retrieved 28/05/2021, from http://web.stanford.edu/class/bios221/MicrobiomeWorkflowII.html
+
+Callahan, B. DADA2 Pipeline Tutorial (1.16). Retrieved 28/05/2021, from https://benjjneb.github.io/dada2/tutorial.html 
+
+Callahan, B. DADA2 ITS Pipeline Workflow (1.8). Retrieved 28/05/2021, from https://benjjneb.github.io/dada2/ITS_workflow.html 
+
+Ollberding, N. (2019). Introduction to the Statistical Analysis of Microbiome Data in R. Retrieved 17/04/2021, from https://www.nicholas-ollberding.com/post/introduction-to-the-statistical-analysis-of-microbiome-data-in-r/
